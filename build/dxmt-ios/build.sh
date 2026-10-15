@@ -17,6 +17,20 @@ OUT_LIB="$BUILD_DIR/libdxmt_unix.a"
 
 mkdir -p "$OBJ_DIR"
 
+# airconv embeds three helper shaders as AIR (dxmt/src/airconv/meson.build:59-69:
+# metal -> .air -> xxd -n <basename>). Generated before the compile loop, which
+# includes them from shader-headers/. Same pinned language version and target.
+mkdir -p "$BUILD_DIR/shader-headers"
+for s in air_msad air_samplepos air_tessellation; do
+    src="$DXMT_SRC/airconv/shaders/$s.metal"
+    if [ ! -f "$BUILD_DIR/shader-headers/$s.h" ] || [ "$src" -nt "$BUILD_DIR/shader-headers/$s.h" ]; then
+        (cd "$BUILD_DIR/shader-headers" \
+         && xcrun -sdk macosx metal -std="${DXMT_METAL_STD:-metal3.1}" --target=air64-apple-macos14.0 \
+              -o "$s.air" -c "$src" \
+         && xxd -n "$s" -i "$s.air" "$s.h")
+    fi
+done
+
 COMMON_FLAGS="-arch arm64 -isysroot $SDK -miphoneos-version-min=18.0 -fblocks -O2"
 INCLUDES="-I$DXMT_ROOT/include -I$DXMT_ROOT/libs -I$DXMT_SRC/winemetal -I$DXMT_SRC/airconv"
 INCLUDES_DIRECTX="-I$DXMT_ROOT/include/native/directx -I$DXMT_ROOT/include/native/windows"

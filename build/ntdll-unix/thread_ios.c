@@ -2448,6 +2448,89 @@ BOOL get_thread_times(int unix_pid, int unix_tid, LARGE_INTEGER *kernel_time, LA
 #endif
 }
 
+
+/* MADEIRA (BO2 audio work): Windows thread priorities used to be bookkeeping only (a
+ * wineserver note), so XAudio2/dsound mixers and the game's sound threads ran at the
+ * same host priority as its render workers and missed their 10 ms deadlines whenever
+ * the CPU was saturated (audio gaps at 60 FPS). Now a priority reaches the host:
+ *   level >= 15 (TIME_CRITICAL)  Mach time-constraint policy (10 ms period, 3 ms budget)
+ *   level  2 / 1 (HIGHEST/ABOVE) QoS user-interactive / user-initiated (P cores)
+ *   level -1 / -2 (BELOW/LOWEST) QoS utility;  level <= -15 (IDLE) QoS background
+ * MADEIRA_THREAD_PRIO=0 disables all of it.  Audio threads are also recognised by
+ * name when they name themselves (MADEIRA_AUDIO_RT=0 disables that part). */
+#include <mach/thread_policy.h>
+#include <mach/mach_time.h>
+extern thread_t ios_thread_port_for_tid( unsigned int tid );
+static int ios_thread_prio_enabled(void)
+{
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("MADEIRA_THREAD_PRIO"); v = !(e && e[0] == '0'); }
+    return v;
+}
+static void ios_apply_host_priority( thread_t port, pthread_t pt, int level, const char *why )
+{
+    kern_return_t kr = KERN_SUCCESS;
+    const char *what = "none";
+    if (!ios_thread_prio_enabled() || !port || level == 0) return;
+    if (level >= 15)
+    {
+        thread_time_constraint_policy_data_t pol;
+        mach_timebase_info_data_t tb;
+        mach_timebase_info( &tb );
+#define IOS_NS2MACH(ns) ((uint32_t)((uint64_t)(ns) * tb.denom / tb.numer))
+        pol.period      = IOS_NS2MACH(10000000);
+        pol.computation = IOS_NS2MACH(3000000);
+        pol.constraint  = IOS_NS2MACH(10000000);
+        pol.preemptible = 1;
+#undef IOS_NS2MACH
+        kr = thread_policy_set( port, THREAD_TIME_CONSTRAINT_POLICY, (thread_policy_t)&pol, THREAD_TIME_CONSTRAINT_POLICY_COUNT );
+        what = "time-constraint";
+    }
+    else
+    {
+        qos_class_t q = level >= 2 ? QOS_CLASS_USER_INTERACTIVE : level == 1 ? QOS_CLASS_USER_INITIATED
+                      : level >= -2 ? QOS_CLASS_UTILITY : QOS_CLASS_BACKGROUND;
+        thread_precedence_policy_data_t pp;
+        if (pt && pthread_equal( pt, pthread_self() )) pthread_set_qos_class_self_np( q, 0 );
+        else if (pt) pthread_override_qos_class_start_np( pt, q, 0 );   /* lives as long as the thread */
+        pp.importance = level >= 2 ? 32 : level == 1 ? 16 : level >= -2 ? -8 : -32;
+        kr = thread_policy_set( port, THREAD_PRECEDENCE_POLICY, (thread_policy_t)&pp, THREAD_PRECEDENCE_POLICY_COUNT );
+        what = level > 0 ? "qos-up" : "qos-down";
+    }
+    ERR( "[thr-prio] %s level=%d -> %s kr=%d (%s)\n", why, level, what, (int)kr, pt && pthread_equal( pt, pthread_self() ) ? "self" : "other" );
+}
+/* Resolve a thread handle to its Mach port and pthread (self fast path, else via the TID). */
+static void ios_apply_priority_to_handle( HANDLE handle, int level, const char *why )
+{
+    thread_t port = 0;
+    pthread_t pt = NULL;
+    if (!ios_thread_prio_enabled() || level == 0) return;
+    if (ios_terminate_is_self( handle ))
+    {
+        port = pthread_mach_thread_np( pthread_self() );
+        pt = pthread_self();
+    }
+    else
+    {
+        THREAD_BASIC_INFORMATION info;
+        if (!NtQueryInformationThread( handle, ThreadBasicInformation, &info, sizeof(info), NULL ))
+        {
+            port = ios_thread_port_for_tid( (unsigned int)(ULONG_PTR)info.ClientId.UniqueThread );
+            if (port) pt = pthread_from_mach_thread_np( port );
+        }
+    }
+    if (port) ios_apply_host_priority( port, pt, level, why );
+    else ERR( "[thr-prio] %s level=%d: handle %p not in the thread registry\n", why, level, handle );
+}
+/* Audio threads that never ask for a priority but need one: by name, when they name themselves. */
+static int ios_audio_thread_level( const char *name )
+{
+    const char *e = getenv("MADEIRA_AUDIO_RT");
+    if (e && e[0] == '0') return 0;
+    if (strstr( name, "FAudio_AudioClientThread" ) || strstr( name, "dsound_mixer" )) return 15;
+    if (strstr( name, "Sound Mix" ) || strstr( name, "Sound Decode" ) || strstr( name, "audio_client_timer" )) return 2;
+    return 0;
+}
 static void set_native_thread_name( HANDLE handle, const UNICODE_STRING *name )
 {
     /* iOS-Madeira ml810: publish the thread name <-> TID <-> TEB mapping.
@@ -2472,6 +2555,11 @@ static void set_native_thread_name( HANDLE handle, const UNICODE_STRING *name )
             ERR( "[thr-name] ml810 tid=%04x teb=%p name=\"%s\"\n",
                  (unsigned)(ULONG_PTR)NtCurrentTeb()->ClientId.UniqueThread,
                  NtCurrentTeb(), nm );
+        if (ios_terminate_is_self( handle ))
+        {
+            int lvl = ios_audio_thread_level( nm );
+            if (lvl) ios_apply_host_priority( pthread_mach_thread_np( pthread_self() ), pthread_self(), lvl, nm );
+        }
         else
             ERR( "[thr-name] ml810 handle=%p (named by tid=%04x, NOT self) name=\"%s\"\n",
                  handle, (unsigned)(ULONG_PTR)NtCurrentTeb()->ClientId.UniqueThread, nm );
@@ -2947,6 +3035,11 @@ NTSTATUS WINAPI NtSetInformationThread( HANDLE handle, THREADINFOCLASS class,
             status = wine_server_call( req );
         }
         SERVER_END_REQ;
+        if (!status)
+        {
+            int p = (int)*priority, lvl = p >= 16 ? 15 : p >= 10 ? 2 : p == 9 ? 1 : p == 8 ? 0 : p >= 6 ? -1 : p >= 2 ? -2 : -15;
+            ios_apply_priority_to_handle( handle, lvl, "ThreadPriority" );
+        }
         return status;
     }
 
@@ -2962,6 +3055,7 @@ NTSTATUS WINAPI NtSetInformationThread( HANDLE handle, THREADINFOCLASS class,
             status = wine_server_call( req );
         }
         SERVER_END_REQ;
+        if (!status) ios_apply_priority_to_handle( handle, (int)(LONG)*base_priority, "ThreadBasePriority" );
         return status;
     }
 

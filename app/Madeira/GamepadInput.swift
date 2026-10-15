@@ -292,6 +292,73 @@ final class GamepadInput: @unchecked Sendable {
         source.resume()
     }
 
+    // MADEIRA pad calibration (BO2 work): software correction for drifting sticks and
+    // self-pressing triggers, from PadLab's "Calibrar". Key MADEIRA_PAD_CAL, read from the
+    // running game's config lines (env.MADEIRA_PAD_CAL = ...), then madeira.cfg, then the
+    // environment: "lx:-0.02,ly:0.01,rx:0.00,ry:0.00,ldz:0.10,rdz:0.10,lt:0.03,rt:0.05,ltz:0.12,rtz:0.14"
+    //   lx/ly/rx/ry  resting value of each stick axis (subtracted)
+    //   ldz/rdz      radial dead zone of each stick, 0..1, rescaled so full travel stays full
+    //   lt/rt        resting value of each trigger (subtracted)
+    //   ltz/rtz      trigger threshold after the subtraction; below it the trigger reads 0
+    struct PadCalibration {
+        var lx: Float = 0, ly: Float = 0, rx: Float = 0, ry: Float = 0, ldz: Float = 0, rdz: Float = 0
+        var lt: Float = 0, rt: Float = 0, ltz: Float = 0, rtz: Float = 0
+        var deb: Float = 0      // button release debounce, ms: a release shorter than this is ignored (bouncing contacts)
+        var lpf: Float = 0      // stick smoothing 0..0.95: share of the previous sample kept (noise filter)
+        var active = false
+
+        static var cached: (key: String, cal: PadCalibration)?
+        static func current() -> PadCalibration {
+            var fromGame: String? = nil
+            if let cfg = LibraryModel.shared.activeEntry?.config {
+                for rawLine in cfg.components(separatedBy: .newlines) {
+                    let line = rawLine.trimmingCharacters(in: .whitespaces)
+                    guard line.hasPrefix("env.MADEIRA_PAD_CAL"), let eq = line.firstIndex(of: "=") else { continue }
+                    let value = line[line.index(after: eq)...]
+                    fromGame = value.trimmingCharacters(in: .whitespaces)
+                    break
+                }
+            }
+            let raw: String = fromGame ?? MadeiraConfig.get("env.MADEIRA_PAD_CAL") ?? ProcessInfo.processInfo.environment["MADEIRA_PAD_CAL"] ?? ""
+            if let c = cached, c.key == raw { return c.cal }
+            let cal = parse(raw)
+            cached = (raw, cal)
+            NSLog("[pad-cal] %@", cal.active ? "active: \(raw)" : "off")
+            return cal
+        }
+        static func parse(_ raw: String) -> PadCalibration {
+            var c = PadCalibration()
+            guard !raw.isEmpty else { return c }
+            for part in raw.split(separator: ",") {
+                let kv = part.split(separator: ":", maxSplits: 1).map { $0.trimmingCharacters(in: .whitespaces) }
+                guard kv.count == 2, let v = Float(kv[1]), v.isFinite else { continue }
+                switch kv[0] {
+                case "lx": c.lx = v; case "ly": c.ly = v; case "rx": c.rx = v; case "ry": c.ry = v
+                case "ldz": c.ldz = max(0, min(0.9, v)); case "rdz": c.rdz = max(0, min(0.9, v))
+                case "lt": c.lt = v; case "rt": c.rt = v
+                case "ltz": c.ltz = max(0, min(0.9, v)); case "rtz": c.rtz = max(0, min(0.9, v))
+                case "deb": c.deb = max(0, min(500, v)); case "lpf": c.lpf = max(0, min(0.95, v))
+                default: break
+                }
+            }
+            c.active = true
+            return c
+        }
+        /// Rest offset removed, radial dead zone, travel rescaled to the full circle.
+        func stick(_ x: Float, _ y: Float, ox: Float, oy: Float, dz: Float) -> (Float, Float) {
+            let sx = x - ox, sy = y - oy
+            let mag = (sx * sx + sy * sy).squareRoot()
+            if mag <= dz || mag == 0 { return (0, 0) }
+            let scale = min(1, (mag - dz) / (1 - dz)) / mag
+            return (max(-1, min(1, sx * scale)), max(-1, min(1, sy * scale)))
+        }
+        func trigger(_ v: Float, rest: Float, tz: Float) -> Float {
+            let t = v - rest
+            if t <= tz { return 0 }
+            return max(0, min(1, (t - tz) / max(0.01, 1 - tz)))
+        }
+    }
+
     // XInput leaves dead zones to the game. Preserve the complete signed range.
     static func axis(_ value: Float) -> Int16 {
         guard value.isFinite else { return 0 }
@@ -301,6 +368,29 @@ final class GamepadInput: @unchecked Sendable {
     static func trigger(_ value: Float) -> UInt8 {
         guard value.isFinite else { return 0 }
         return UInt8((max(0, min(1, value)) * 255).rounded())
+    }
+
+    // MADEIRA pad calibration: debounce and smoothing state (player 1 only).
+    private var debouncedButtons: UInt16 = 0           // buttons as reported after debounce
+    private var releaseSince: [UInt16: TimeInterval] = [:]   // mask -> time the raw release began
+    private var smoothed: (lx: Float, ly: Float, rx: Float, ry: Float) = (0, 0, 0, 0)
+
+    private func debounce(raw: UInt16, ms: Float) -> UInt16 {
+        let now = ProcessInfo.processInfo.systemUptime
+        var out = debouncedButtons
+        for bit in 0..<16 {
+            let mask = UInt16(1) << UInt16(bit)
+            let rawDown = raw & mask != 0, down = out & mask != 0
+            if rawDown {
+                out |= mask; releaseSince[mask] = nil             // presses pass through at once
+            } else if down {
+                let since = releaseSince[mask] ?? now
+                releaseSince[mask] = since
+                if (now - since) * 1000 >= Double(ms) { out &= ~mask; releaseSince[mask] = nil }
+            }
+        }
+        debouncedButtons = out
+        return out
     }
 
     private func sample() {
@@ -337,12 +427,29 @@ final class GamepadInput: @unchecked Sendable {
                     (pad.buttonB, 0x2000), (pad.buttonX, 0x4000), (pad.buttonY, 0x8000)
                 ]
                 for (button, mask) in buttons where button?.isPressed == true { state.buttons |= mask }
-                state.left_trigger = Self.trigger(pad.leftTrigger.value)
-                state.right_trigger = Self.trigger(pad.rightTrigger.value)
-                state.lx = Self.axis(pad.leftThumbstick.xAxis.value)
-                state.ly = Self.axis(pad.leftThumbstick.yAxis.value)
-                state.rx = Self.axis(pad.rightThumbstick.xAxis.value)
-                state.ry = Self.axis(pad.rightThumbstick.yAxis.value)
+                let cal = PadCalibration.current()
+                if cal.active {
+                    if i == 0 && cal.deb > 0 { state.buttons = debounce(raw: state.buttons, ms: cal.deb) }
+                    var (clx, cly) = cal.stick(pad.leftThumbstick.xAxis.value, pad.leftThumbstick.yAxis.value, ox: cal.lx, oy: cal.ly, dz: cal.ldz)
+                    var (crx, cry) = cal.stick(pad.rightThumbstick.xAxis.value, pad.rightThumbstick.yAxis.value, ox: cal.rx, oy: cal.ry, dz: cal.rdz)
+                    if i == 0 && cal.lpf > 0 {
+                        let k = cal.lpf
+                        smoothed = (smoothed.lx * k + clx * (1 - k), smoothed.ly * k + cly * (1 - k),
+                                    smoothed.rx * k + crx * (1 - k), smoothed.ry * k + cry * (1 - k))
+                        (clx, cly, crx, cry) = (smoothed.lx, smoothed.ly, smoothed.rx, smoothed.ry)
+                    }
+                    state.left_trigger = Self.trigger(cal.trigger(pad.leftTrigger.value, rest: cal.lt, tz: cal.ltz))
+                    state.right_trigger = Self.trigger(cal.trigger(pad.rightTrigger.value, rest: cal.rt, tz: cal.rtz))
+                    state.lx = Self.axis(clx); state.ly = Self.axis(cly)
+                    state.rx = Self.axis(crx); state.ry = Self.axis(cry)
+                } else {
+                    state.left_trigger = Self.trigger(pad.leftTrigger.value)
+                    state.right_trigger = Self.trigger(pad.rightTrigger.value)
+                    state.lx = Self.axis(pad.leftThumbstick.xAxis.value)
+                    state.ly = Self.axis(pad.leftThumbstick.yAxis.value)
+                    state.rx = Self.axis(pad.rightThumbstick.xAxis.value)
+                    state.ry = Self.axis(pad.rightThumbstick.yAxis.value)
+                }
                 // The library front end navigates with player 1's pad (Library.swift).
                 // While it owns input (no session, or its menu is open) the game
                 // sees a connected pad at rest.

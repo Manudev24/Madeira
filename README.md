@@ -10,6 +10,15 @@
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-GPL--3.0--or--later-yellow?style=for-the-badge" alt="License: GPL-3.0-or-later"></a>
 </p>
 
+> [!IMPORTANT]
+> **This is a fork of Madeira for Call of Duty: Black Ops II (Zombies).**
+> It plays Black Ops II Zombies through the Plutonium T6 client at about
+> **60 FPS on an iPhone 15 Pro Max**, the only phone it has been tested on.
+> Setup guide: **[docs/BLACK_OPS_2.md](docs/BLACK_OPS_2.md)** ·
+> **[Guía en español](docs/BLACK_OPS_2.es.md)** ·
+> IPA: [Releases](https://github.com/Manudev24/Madeira/releases).
+> No game or Plutonium files are included. The rest of this README is upstream Madeira's.
+
 Madeira runs Windows PC games on an iPhone, with no jailbreak. Games run as they
 are, unmodified, inside a single iOS app.
 

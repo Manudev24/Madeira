@@ -4570,7 +4570,10 @@ void server_init_process_done(void)
          * ios_thread_sampler_main() above. */
         if (__sync_bool_compare_and_swap(&ios_ts_armed, 0, 1))
         {
-            dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{ ios_thread_sampler_main(); });
+            /* MADEIRA_NO_SAMPLER=1 (BO2 perf work): skip the task-wide thread sampler, which
+             * suspends every running thread 4x250 ms every 20 s; xprobe/wprof (counters) stay. */
+            if (!getenv("MADEIRA_NO_SAMPLER"))
+                dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{ ios_thread_sampler_main(); });
             dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{ ios_xprobe_main(); });   /* ml1128 */
             dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{ ios_wprof_main(); });   /* ml1129 */
         }

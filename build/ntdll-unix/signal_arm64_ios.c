@@ -653,6 +653,21 @@ int ios_thread_registry_range_busy( uintptr_t base, uintptr_t size )
     return 0;
 }
 
+/* MADEIRA (BO2 audio work): Mach port of the live Wine thread whose Windows TID is
+ * `tid`, 0 when unknown. Scans the registry and reads each TEB's ClientId. */
+thread_t ios_thread_port_for_tid( unsigned int tid )
+{
+    int count = __sync_fetch_and_add(&ios_thread_count, 0), i;
+    if (count > IOS_MAX_WINE_THREADS) count = IOS_MAX_WINE_THREADS;
+    for (i = 0; i < count; i++)
+    {
+        uintptr_t teb = ios_thread_registry[i].teb;
+        thread_t port = ios_thread_registry[i].mach_thread;
+        if (!teb || !port) continue;
+        if ((unsigned int)(ULONG_PTR)((TEB *)teb)->ClientId.UniqueThread == tid) return port;
+    }
+    return 0;
+}
 static int ios_lookup_thread(thread_t mach_thread, uintptr_t *teb_out, void **tramp_out)
 {
     int count = __sync_fetch_and_add(&ios_thread_count, 0);
@@ -4672,6 +4687,20 @@ skip_reclaim_band: ;
                      * This does NOT fix the missing commit -- it stops one page from
                      * eating an entire run, and dumps the region layout around it so the
                      * owner can be identified and the real fix aimed correctly. */
+                    /* MADEIRA hwbp: FEX raises every guest trap it generates itself (hardware
+                     * breakpoints, int3, TF single-step, #UD) with a `brk #0` (GuestSignal_SIGTRAP
+                     * stub) or `hlt #0` (GuestSignal_SIGILL stub) at ONE fixed JIT pc, with the
+                     * fault address equal to that pc. Each one is delivered to guest SEH and makes
+                     * progress, so they must not feed the livelock breaker: Plutonium's reveal
+                     * mechanism took 50 hardware breakpoints and the breaker killed its loader
+                     * thread on the 51st (every run, same count). */
+                    int fex_soft_trap = 0;
+                    if (!terminal_pc)
+                    {
+                        uint32_t insn_pc = *(volatile uint32_t *)fault_pc_check;
+                        fex_soft_trap = (insn_pc == 0xd4200000u || insn_pc == 0xd4400000u);
+                    }
+                    if (!fex_soft_trap)
                     {
                         static volatile uint64_t stuck_page;
                         static volatile uint64_t stuck_pc;
